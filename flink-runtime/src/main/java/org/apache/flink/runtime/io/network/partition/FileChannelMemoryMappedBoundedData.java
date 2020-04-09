@@ -18,7 +18,13 @@
 
 package org.apache.flink.runtime.io.network.partition;
 
+import net.jpountz.lz4.LZ4Compressor;
+import net.jpountz.lz4.LZ4Factory;
+import org.apache.flink.core.memory.MemorySegment;
+import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
+import org.apache.flink.runtime.io.network.buffer.FreeingBufferRecycler;
+import org.apache.flink.runtime.io.network.buffer.NetworkBuffer;
 import org.apache.flink.util.IOUtils;
 
 import org.apache.flink.shaded.netty4.io.netty.util.internal.PlatformDependent;
@@ -56,36 +62,58 @@ import static org.apache.flink.util.Preconditions.checkState;
  */
 final class FileChannelMemoryMappedBoundedData implements BoundedData {
 
-	/** The file channel backing the memory mapped file. */
+	/**
+	 * The file channel backing the memory mapped file.
+	 */
 	private final FileChannel fileChannel;
 
-	/** The reusable array with header buffer and data buffer, to use gathering writes on the
-	 * file channel ({@link java.nio.channels.GatheringByteChannel#write(ByteBuffer[])}). */
+	/**
+	 * The reusable array with header buffer and data buffer, to use gathering writes on the
+	 * file channel ({@link java.nio.channels.GatheringByteChannel#write(ByteBuffer[])}).
+	 */
 	private final ByteBuffer[] headerAndBufferArray;
 
-	/** All memory mapped regions. */
+	/**
+	 * All memory mapped regions.
+	 */
 	private final ArrayList<ByteBuffer> memoryMappedRegions;
 
-	/** The path of the memory mapped file. */
+	/**
+	 * The path of the memory mapped file.
+	 */
 	private final Path filePath;
 
-	/** The position in the file channel. Cached for efficiency, because an actual position
-	 * lookup in the channel involves various locks and checks. */
+	/**
+	 * The position in the file channel. Cached for efficiency, because an actual position
+	 * lookup in the channel involves various locks and checks.
+	 */
 	private long pos;
 
-	/** The position where the current memory mapped region must end. */
+	/**
+	 * The position where the current memory mapped region must end.
+	 */
 	private long endOfCurrentRegion;
 
-	/** The position where the current memory mapped started. */
+	/**
+	 * The position where the current memory mapped started.
+	 */
 	private long startOfCurrentRegion;
 
-	/** The maximum size of each mapped region. */
+	/**
+	 * The maximum size of each mapped region.
+	 */
 	private final long maxRegionSize;
 
+	// 用于接收LZ4压缩后的数据，复用对象
+	private final ByteBuffer compressBuf = ByteBuffer.allocateDirect(32 * 1024);
+	// 压缩
+	private final LZ4Compressor lz4Compressor = LZ4Factory.fastestInstance().fastCompressor();
+
+
 	FileChannelMemoryMappedBoundedData(
-			Path filePath,
-			FileChannel fileChannel,
-			int maxSizePerMappedRegion) {
+		Path filePath,
+		FileChannel fileChannel,
+		int maxSizePerMappedRegion) {
 
 		this.filePath = filePath;
 		this.fileChannel = fileChannel;
@@ -110,15 +138,42 @@ final class FileChannelMemoryMappedBoundedData implements BoundedData {
 
 	private boolean tryWriteBuffer(Buffer buffer) throws IOException {
 		final long spaceLeft = endOfCurrentRegion - pos;
-		final long bytesWritten = BufferReaderWriterUtil.writeToByteChannelIfBelowSize(
-				fileChannel, buffer, headerAndBufferArray, spaceLeft);
 
-		if (bytesWritten >= 0) {
-			pos += bytesWritten;
-			return true;
-		}
-		else {
-			return false;
+		ByteBuffer nioBuffer = buffer.getNioBufferReadable();
+
+		// 针对不同的buffer类型，调用LZ4的不同压缩接口
+		if (nioBuffer.isDirect()) {
+			compressBuf.clear();
+			lz4Compressor.compress(nioBuffer, compressBuf);
+			compressBuf.flip();
+			// 如果spaceLeft < buffer大小 ，切换到下一个缓冲区
+			if (spaceLeft < compressBuf.limit()) {
+				return false;
+			} else {
+				MemorySegment memorySegment = MemorySegmentFactory.wrapOffHeapMemory(compressBuf);
+				final Buffer newBuffer = new NetworkBuffer(memorySegment, FreeingBufferRecycler.INSTANCE, buffer.isBuffer());
+				newBuffer.setSize(compressBuf.limit());
+				final long bytesWritten = BufferReaderWriterUtil.writeToByteChannelIfBelowSize(
+					fileChannel, newBuffer, headerAndBufferArray, spaceLeft);
+				pos += bytesWritten;
+				return true;
+			}
+		} else {
+			byte[] data = new byte[nioBuffer.remaining()];
+			nioBuffer.get(data);
+			byte[] compressedData = lz4Compressor.compress(data);
+			// 如果spaceLeft < buffer大小 ，切换到下一个缓冲区
+			if (spaceLeft < compressedData.length) {
+				return false;
+			} else {
+				MemorySegment memorySegment = MemorySegmentFactory.wrap(compressedData);
+				final Buffer newBuffer = new NetworkBuffer(memorySegment, FreeingBufferRecycler.INSTANCE, buffer.isBuffer());
+				newBuffer.setSize(compressedData.length);
+				final long bytesWritten = BufferReaderWriterUtil.writeToByteChannelIfBelowSize(
+					fileChannel, newBuffer, headerAndBufferArray, spaceLeft);
+				pos += bytesWritten;
+				return true;
+			}
 		}
 	}
 
@@ -129,8 +184,8 @@ final class FileChannelMemoryMappedBoundedData implements BoundedData {
 		final List<ByteBuffer> buffers = memoryMappedRegions.stream()
 				.map((bb) -> bb.duplicate().order(ByteOrder.nativeOrder()))
 				.collect(Collectors.toList());
-
-		return new MemoryMappedBoundedData.BufferSlicer(buffers);
+		// 返回数据前需要先解压，替换为了带解压的Reader
+		return new MemoryMappedBoundedData.CompressedBufferSlicer(buffers);
 	}
 
 	/**
@@ -179,8 +234,8 @@ final class FileChannelMemoryMappedBoundedData implements BoundedData {
 
 	private void throwTooLargeBuffer(Buffer buffer) throws IOException {
 		throw new IOException(String.format(
-				"The buffer (%d bytes) is larger than the maximum size of a memory buffer (%d bytes)",
-				buffer.getSize(), maxRegionSize));
+			"The buffer (%d bytes) is larger than the maximum size of a memory buffer (%d bytes)",
+			buffer.getSize(), maxRegionSize));
 	}
 
 	// ------------------------------------------------------------------------
@@ -203,7 +258,7 @@ final class FileChannelMemoryMappedBoundedData implements BoundedData {
 		checkArgument(regionSize > 0, "regions size most be > 0");
 
 		final FileChannel fileChannel = FileChannel.open(memMappedFilePath,
-				StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
+			StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);
 
 		return new FileChannelMemoryMappedBoundedData(memMappedFilePath, fileChannel, regionSize);
 	}

@@ -18,6 +18,8 @@
 
 package org.apache.flink.runtime.io.network.partition;
 
+import net.jpountz.lz4.LZ4Factory;
+import net.jpountz.lz4.LZ4SafeDecompressor;
 import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
@@ -91,6 +93,53 @@ final class BufferReaderWriterUtil {
 				FreeingBufferRecycler.INSTANCE,
 				size,
 				header == HEADER_VALUE_IS_EVENT);
+	}
+
+	static private final LZ4SafeDecompressor lz4Compressor = LZ4Factory.fastestInstance().safeDecompressor();
+
+	// 分块解压，不会出现压缩块不完整的情况
+	@Nullable
+	static Buffer sliceNextBufferWithUncompress(ByteBuffer memory, ByteBuffer compressBuf) {
+		final int remaining = memory.remaining();
+
+		// we only check the correct case where data is exhausted
+		// all other cases can only occur if our write logic is wrong and will already throw
+		// buffer underflow exceptions which will cause the read to fail.
+		if (remaining == 0) {
+			return null;
+		}
+
+		final int header = memory.getInt();
+		final int size = memory.getInt();
+
+		memory.limit(memory.position() + size);
+		ByteBuffer buf = memory.slice();
+		memory.position(memory.limit());
+		memory.limit(memory.capacity());
+		compressBuf.clear();
+//		try {
+//			Snappy.uncompress(buf, compressBuf);
+		lz4Compressor.decompress(buf, compressBuf);
+		compressBuf.flip();
+//		} catch (Exception e) {
+//			throw new RuntimeException(e);
+//		}
+		MemorySegment memorySegment;
+//		if(compressBuf.limit() != compressBuf.capacity()) {
+//			ByteBuffer tmp = ByteBuffer.allocateDirect(compressBuf.limit());
+//			tmp.put(compressBuf);
+//			tmp.flip();
+//			memorySegment = MemorySegmentFactory.wrapOffHeapMemory(tmp);
+//		} else {
+		memorySegment = MemorySegmentFactory.wrapOffHeapMemory(compressBuf);
+//		}
+
+
+		return bufferFromMemorySegment(
+			memorySegment,
+			FreeingBufferRecycler.INSTANCE,
+			compressBuf.limit(),
+			header == HEADER_VALUE_IS_EVENT);
 	}
 
 	// ------------------------------------------------------------------------
